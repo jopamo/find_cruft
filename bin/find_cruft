@@ -351,11 +351,12 @@ my $outputfile = '';
 my $openmode   = '>>';
 my $verbose    = 0;
 our $root = '';
+my $delete = 0;
 
 # Parse Options:
 
 Getopt::Long::Configure(qw(gnu_getopt no_ignore_case));
-Getopt::Long::GetOptions( 'help|h', sub { &pod2usage(0) }, 'man|?', sub { &pod2usage( -verbose => 2, -exit => 0 ) }, 'version|V', \&version, 'output|o=s', sub { $outputfile = $_[1]; $openmode = '>>' }, 'Output|O=s', sub { $outputfile = $_[1]; $openmode = '>' }, 'root|r=s', \$root, 'cfg|c=s', \@configs, 'nocfg|C', sub { @configs = () }, 'verbose|v+', \$verbose, ) or &pod2usage(2);
+Getopt::Long::GetOptions( 'help|h', sub { &pod2usage(0) }, 'man|?', sub { &pod2usage( -verbose => 2, -exit => 0 ) }, 'version|V', \&version, 'output|o=s', sub { $outputfile = $_[1]; $openmode = '>>' }, 'Output|O=s', sub { $outputfile = $_[1]; $openmode = '>' }, 'root|r=s', \$root, 'cfg|c=s', \@configs, 'nocfg|C', sub { @configs = () }, 'verbose|v+', \$verbose, 'delete|d' => \$delete, ) or &pod2usage(2);
 
 &pod2usage(2) unless (@ARGV);
 
@@ -750,11 +751,25 @@ sub wanted_files {
   }
   return if ( exists( $skip{$path} ) );
   $skip{$path} = undef;
-  if ( defined($fh) ) {
-    print( $fh $path, "\n" );
+
+  if ($delete) {
+    if ( -f $_ || -l $_ ) {
+      unlink($_) or warn "Failed to delete file: $path\n";
+    }
+    elsif ( -d $_ ) {
+      rmdir($_) or warn "Failed to delete directory (not empty?): $path\n";
+    }
+    else {
+      warn "Unsupported file type: $path\n";
+    }
   }
   else {
-    print( $path, "\n" );
+    if ( defined($fh) ) {
+      print( $fh $path, "\n" );
+    }
+    else {
+      print( $path, "\n" );
+    }
   }
 }
 
