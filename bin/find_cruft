@@ -342,7 +342,7 @@ my $fh          = undef;
 my $home        = undef;
 my %skip        = ();
 my %valid_types = ();
-my @ignore_list = ( "/etc/group", "/etc/group-", "/etc/gshadow", "/etc/gshadow-", "/etc/ld.so.cache", "/etc/passwd", "/etc/passwd-", "/etc/portage/make.conf", "/etc/shadow", "/etc/shadow-", "/usr/lib/modules/" );
+my @ignore_list = ( "/etc/group", "/etc/group-", "/etc/gshadow", "/etc/gshadow-", "/etc/ld.so.cache", "/etc/passwd", "/etc/passwd-", "/etc/portage/make.conf", "/etc/shadow", "/etc/shadow-", "/usr/lib/modules/", "/var/cache/binpkgs/", "/var/cache/distfiles/", "/etc/config-archive/" );
 
 # Default for the Options:
 
