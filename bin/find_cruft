@@ -340,6 +340,19 @@ my $fh = undef;
 my $home = undef;
 my %skip = ();
 my %valid_types = ();
+my @ignore_list = (
+	"/etc/group",
+	"/etc/group-",
+	"/etc/gshadow",
+	"/etc/gshadow-",
+	"/etc/ld.so.cache",
+	"/etc/passwd",
+	"/etc/passwd-",
+	"/etc/portage/make.conf",
+	"/etc/shadow",
+	"/etc/shadow-",
+	"/usr/lib/modules/"
+);
 
 # Default for the Options:
 
@@ -738,10 +751,11 @@ sub match_array {
 sub wanted_files {
 	my $path = &remove_root($_);
 	return if (($path eq '') or ($path eq $rootdir));
+	return if &is_ignored($path);
 	if (exists($cut{$path}) || &match_array(\$path, \@cutre)) {
 		unless (&match_array(\$path, \@cutexceptions)) {
 			$File::Find::prune = 1;
-			return
+			return;
 		}
 	}
 	if (-l $_) {
@@ -770,4 +784,16 @@ sub process_dirs {
 		dangling_symlinks => '',
 		wanted => \&wanted_files
 	}, @$dirs)
+}
+
+sub is_ignored {
+	my $path = shift;
+	foreach my $ignore (@ignore_list) {
+		if ($ignore =~ /\/$/) {
+			return 1 if $path =~ /^\Q$ignore\E/;
+		} else {
+			return 1 if $path eq $ignore;
+		}
+	}
+	return 0;
 }
