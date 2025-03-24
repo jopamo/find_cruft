@@ -1,420 +1,142 @@
 #!/usr/bin/env perl
-# SPDX-License-Identifier: BSD-3-Clause
-BEGIN { require 5.008 }
-
-package FindCruft;
-our $VERSION = 'v5.2.0';
-eval { $VERSION = version->declare($VERSION) };
-eval 'use version 0.77; $VERSION = version->declare($VERSION)' if ($@);
 
 use strict;
 use warnings;
-use integer;
-use Cwd               ();
-use Exporter          qw(import);
-use File::Find        ();
-use File::Spec        ();
-use Getopt::Long 2.24 ();
-
-#use Pod::Usage ();
-
-=encoding UTF-8
-
-=head1 NAME
-
-find_cruft - find cruft files on Gentoo and similar distributions
-
-=head1 SYNOPSIS
-
-=over 8
-
-=item B<find_cruft> [options] I<directory1> I<directory2> ...
-
-Scan for cruft files in I<directory1>, I<directory2>, ...
-
-=back
-
-To get an extended help, type B<find_cruft --man> or B<find_cruft -?>
-
-=head1 DESCRIPTION
-
-Gentoo records all installed files in a database.
-Files not stored in this database are either manually installed or
-intentionally created at runtime or cruft.
-find_cruft will output all files from the directories passed in the arguments
-(or of subdirectories thereof) which are not recorded in the database and
-which are not obviously intentionally created files, i.e. all files which are
-possibly considered as cruft.
-
-Typically you will want to call with B</> as argument to get all cruft files.
-However, you might also want to use e.g. B</usr/lib/python*> or
-B</usr/lib/perl*> to find only those files which were created in this
-directory (e.g. by B<perl-cleaner>) without being recorded to portage's
-database and which might possibly need extra care after updating perl.
-
-Using configuration files (in perl) you have the possibility to say that
-certain symbolic links should be followed or that certain directories or
-files should be cut and not be treated as cruft even if it appears so.
-
-You also have the possibility to specify a separate root directory which
-can save you from using chroot when you have a chroot installation fo Gentoo.
-When using that option, the new root is implicitly prepended to the
-passed arguments.
-
-Use the B<-vv> option to see what is actually passed.
-
-=head1 OPTIONS
-
-=over 8
-
-=item B<--help> or B<-h>
-
-Display brief help.
-
-=item B<--man> or B<-?>
-
-Display extended help as a manpage.
-
-=item B<--verbose> or B<-v> (accumulative)
-
-Verbose output.
-Specifying several times makes output even more verbose.
-More precisely:
-
-=over 8
-
-=item B<-v>
-outputs the parsed configuration files.
-
-=item B<-vv>
-outputs in addition B<$root> and the parsed arguments
-
-=item B<-vvv>
-outputs in addition the data defined in the configuration files.
-
-=back
-
-These additional informations are sent to B<STDERR> unless you use an
-option to specify an output file in which case they are sent to B<STDOUT>.
-
-=item B<--version> or B<-V>
-
-Print version number and exit
-
-=item B<--root>[B<=>I<dir>] or B<-r> I<dir>
-
-Prefix I<dir> to most directories to behave similar as to B<chroot> I<dir>.
-In particular, I<dir> is automatically prepended to the directories which
-you pass as arguments.
-The idea is that this should save you a B<chroot> if you want to access
-a chroot-installation of Gentoo.
-However, this will not always give the desired results (since e.g. absolute
-symlinks are not always be treated correctly), so you should be sceptical
-whether the cruft list is correct: There may be false positives and negatives.
-
-=item B<--cfg>[B<=>I<file>] or B<-c> I<file>
-
-Use I<file> as an additional configuration file.
-This can be used accumulatively.
-
-=item B<--nocfg> or B<-C>
-
-Clear previous (and default) list of configuration files.
-
-=item B<--output>[B<=>I<file>] or B<-o> I<file>
-
-Append to I<file> instead of writing to stdout.
-If I<file> does not exist, it is created.
-If I<file> is empty, stdout is used anyway.
-
-=item B<--Output>[B<=>I<file>] or B<-O> I<file>
-
-As B<--output> but truncate (clobber) I<file> if it exists.
-
-=item B<-->
-
-Last option
-
-=back
-
-=head1 CONFIG FILES
-
-The default config-files are (read in this order):
-
-=over 8
-
-=item F<$/etc/find_cruft.pl|$/usr/lib/find_cruft/find_cruft.pl|$/usr/share/find_cruft/find_cruft.pl>
-
-=item F<$/etc/find_cruft.d|$/usr/lib/find_cruft/find_cruft.d|$/usr/share/find_cruft/find_cruft.d>
-
-=back
-
-The magic beginning B<$> means the value specified in B<--root>,
-and the magic beginning B<~> (not used in the defaults) means the user's
-home directory.
-If the path is a directory, all files in this directory of the form B<*.pl>
-and not starting with a dot are read.
-If there are several paths separated by B<|> the later paths are only fallbacks
-in the following sense: If a path is a readable non-directory, then all
-fallback paths ignored. If a path is a readable directory, then in the
-later directories only those filenames are read which are not readable in
-former directories.
-
-Further files can be added with the B<--cfg> option.
-The list can be cleaned up with the B<--nocfg> option.
-
-The config-files can be any valid perl code. The last executed command
-in these files should be a true perl expression (e.g. 1).
-The config-files get passed the following arrays with some default values,
-and their task is to enlarge these arrays to match the local system.
-(They can also shrink these arrays, of course, if the user wants to
-get reported files in certain directories as cruft.)
-
-=over 8
-
-=item B<@cut>
-
-Contains files/directories which should be cut recursively.
-The entries must be the full paths (without reflecting B<--root>);
-no wildcards are allowed.
-Undefined or Empty entries are ignored, and redundant B</> symbols in
-entries are automatically removed.
-Increasing this list (even dramatically) has almost no influence on the speed.
-
-=item B<@cutre>
-
-This is similar as B<@cut> with the difference that the entries of this
-list are considered as (perl) regular expressions.
-The entries can be strings or compiled regular expressions.
-Strings will automatically be compiled as a regular expression without flags.
-Increase this list sparingly since every file in your tree is matched against
-every entry in this list!
-
-=item B<@cutexceptions>
-
-This is in a sense the opposite to B<@cutre>, i.e. files matching B<@cut>
-or B<@cutre> must B<not> match against the regular expressions of this list,
-or otherwise the effect of B<@cut>/B<@cutre> is ignored.
-
-=item B<@symlinks>
-
-This array consists of entries of the form
-['I<link1>', 'I<link2>', ..., 'I<directory>']
-It means that in the database the path beginnings I<link1> of I<link2>
-correspond due to symlinks to files in I<directory>.
-Only absolute paths are allowed.
-
-An entry is ignored if B<$root>I<directory> is not an existing directory or
-if any of its path components is a symlink.
-Likewise and contrary, a I<link...> entry is ignored if B<$root>I<link...>
-exists and none of its path components is a symlink.
-(The case that B<$root>I<link...> does not exist is allowed in order to deal
-with the case that a symlink was removed after an emerge.)
-If there are several symlink combinations used, you must list them all here;
-there is intentionally no automatism which creates combinations since this
-can lead to huge lists (and a huge slowdown) while most combinations are
-actually not necessary.
-It is not really bad if you forget to add a symlink here: The only negative
-effect is that files installed by ebuilds into the symlink instead of the
-directory will be reported as cruft, so you just see your mistake from
-the output list and can fix it (or live with the false positives).
-
-=item B<@follow>
-
-Contains symlinks which should be followed when getting the file tree.
-This should be used if certain parts of your tree lie e.g. on another file
-system to which you refer by symbolic links.
-The entries must be the full paths (without B<--root>); no wildcards.
-Increasing this list even dramatically has almost no influence on the speed
-(except that the list of processed files will increase, of course.)
-
-=back
-
-The B<--root> path is accessible as B<$root> (but changing it has no effect).
-Note that you can use perl's B<push()> to append to an existing array.
-Some further helper functions are defined:
-
-=over 8
-
-=item B<remove_root(>I<string>B<)>
-
-This will return I<string>, but if I<string> starts with B<$root>
-this part is removed.
-This is usuful e.g. if you resolve symlinks with B<Cwd::abs_path> and do not
-know whether the result points to a subdirectory of B<$root>
-
-=item B<push_without_root(>I<@array>B<, >I<list>B<)>
-
-This function is like B<push()> except that B<remove_root> is applied to all
-pushed arguments and except that undefined or empty strings are not pushed.
-
-=item B<fatal>(I<line1>, I<line2>, ...)
-
-Output a fatal error and die.
-
-=back
-
-To see an example configuration, it is recommended to look at the
-system default F</usr/lib/find_cruft/find_cruft.pl> or F</etc/find_cruft.pl>.
-Here are some more hypothetical examples:
-
-=over 8
-
-=item push(@cut, qw(/dev /proc /sys /run /media /mnt /tmp));
-
-This is actually redundant:
-The above directories are the default in B<@cut>.
-The reason for this default is that it usually never makes sense
-(and can even cause problems) trying to scan these directories.
-Remove them from B<@cut> only if you know what you are doing!
-
-=item push(@cut, qw(/home /root /srv /boot /var/tmp /var/db /var/cache/edb));
-
-On most gentoo systems you will never want to consider stuff in these
-directories never as cruft.
-Therefore, these directories (and some more) are added to B<@cut> by
-the default F</usr/lib/find_cruft/find_cruft.pl>.
-
-=item push(@cut, qw(/var/cache/fontconfig /usr/share/mime
-
-=item /lib/modules /lib64/modules /var/log/portage /usr/local));
-
-The above directories usually contain a lot of false positives which you might
-want to suppress in the output unless you do a very rigorous cleanup.
-However, since in a sense all these directories are cruft, they are not
-contained in the default setting (nor F</usr/lib/find_cruft/find_cruft.pl>).
-Therefore you might want to put this into F</etc/find_cruft.d/99-local.pl>).
-
-=item push(@cut, '/etc/find_cruft.d/99-local.pl');
-
-If you always want to suppress the output of that file.
-
-=item push(@cutre, '/\.keep[^/]*$', qr{/joe[^/]*$}i);
-
-Files/dirs with names F<.keep*>, F<joe*>, F<Joe*>, F<JOE*>, ... are ignored.
-
-=item push(@cutexceptions, '^/\.keep$', qr{/jOe[^/]*$});
-
-The path B</.keep> (in the B<--root> directory) and the filenames B<jOe*>
-are exceptions from the above general rules in B<@cutre>.
-
-=item push(@symlinks, [qw(/usr/X11 /usr/X11/X11 /usr)]);
-
-Use this if you have a very old Gentoo installations with a symlink from
-B</usr/X11> to B</usr>.
-This  means that if an ebuild had installed into B</usr/X11> or
-B</usr/X11/X11> or into B</usr/X11/X11/X11> or ... it actually installed into
-B</usr>, and so the corresponding file in B</usr> is actually not cruft.
-Note that in theory the list of admissible directories is infinitely long,
-but in practice, there will probably not even be an ebuild which installs
-into B</usr/X11/X11/X11> so that it is reasonable to consider only the
-first two cases as symlinks.
-Probably even the second entry B</usr/X11/X11> is not necessary in practice
-(unless you have strange ebuilds from some overlays).
-However, current ebuilds will never install into B</usr/X11> so that
-usually the above customization is not necessary.
-
-=item push(@follow, qw(/etc /usr/share/texmf-dist));
-
-Put such things into B</etc/find_cruft.d/99-local.pl> if on your machine
-F</etc> and F</usr/share/texmf-dist> are symlinks to e.g. separate partitions.
-
-=back
-
-=head1 COPYRIGHT AND LICENSE
-
-Copyright Martin VE<auml>th. This program is under the BSD License.
-
-=head1 AUTHOR
-
-Martin VE<auml>th E<lt>martin@mvath.deE<gt>
-
-=cut
-
-# Static variables:
+use File::Find ();
+use Getopt::Long ();
+use Pod::Usage   ();
+use File::Spec   ();
+use Cwd          ();
+use File::Path   qw(remove_tree);
+
+# -------------------------------
+# Static variables
+# -------------------------------
 
 my $name    = 'find_cruft';
 my $rootdir = File::Spec->rootdir();
 
-# Global variables;
+# -------------------------------
+# Global variables
+# -------------------------------
 
 my $fh          = undef;
 my $home        = undef;
 my %skip        = ();
 my %valid_types = ();
-my @ignore_list = ( "/etc/group", "/etc/group-", "/etc/gshadow", "/etc/gshadow-", "/etc/ld.so.cache", "/etc/passwd", "/etc/passwd-", "/etc/portage/make.conf", "/etc/shadow", "/etc/shadow-", "/usr/lib/modules/", "/var/cache/binpkgs/", "/var/cache/distfiles/", "/etc/config-archive/" );
+my @ignore_list = (
+    "/etc/group",
+    "/etc/group-",
+    "/etc/gshadow",
+    "/etc/gshadow-",
+    "/etc/ld.so.cache",
+    "/etc/passwd",
+    "/etc/passwd-",
+    "/etc/portage/make.conf",
+    "/etc/shadow",
+    "/etc/shadow-",
+    "/usr/lib/modules/",
+    "/var/cache/binpkgs/",
+    "/var/cache/distfiles/",
+    "/etc/config-archive/"
+);
 
-# Default for the Options:
+# -------------------------------
+# Default for the Options
+# -------------------------------
 
-my @configs    = ( '$/etc/find_cruft.pl|$/usr/lib/find_cruft/find_cruft.pl|$/usr/share/find_cruft/find_cruft.pl', '$/etc/find_cruft.d|$/usr/lib/find_cruft/find_cruft.d|$/usr/share/find_cruft/find_cruft.d', );
+my @configs = (
+    '$/etc/find_cruft.pl|$/usr/lib/find_cruft/find_cruft.pl|$/usr/share/find_cruft/find_cruft.pl',
+    '$/etc/find_cruft.d|$/usr/lib/find_cruft/find_cruft.d|$/usr/share/find_cruft/find_cruft.d',
+);
 my $outputfile = '';
 my $openmode   = '>>';
 my $verbose    = 0;
-our $root = '';
-my $delete = 0;
+our $root      = '';
+my $delete     = 0;
 
-# Parse Options:
+# -------------------------------
+# Parse Options
+# -------------------------------
 
 Getopt::Long::Configure(qw(gnu_getopt no_ignore_case));
-Getopt::Long::GetOptions( 'help|h', sub { &pod2usage(0) }, 'man|?', sub { &pod2usage( -verbose => 2, -exit => 0 ) }, 'version|V', \&version, 'output|o=s', sub { $outputfile = $_[1]; $openmode = '>>' }, 'Output|O=s', sub { $outputfile = $_[1]; $openmode = '>' }, 'root|r=s', \$root, 'cfg|c=s', \@configs, 'nocfg|C', sub { @configs = () }, 'verbose|v+', \$verbose, 'delete|d' => \$delete, ) or &pod2usage(2);
+Getopt::Long::GetOptions(
+    'help|h'    => sub { &pod2usage(0) },
+    'man|?'     => sub { &pod2usage( -verbose => 2, -exit => 0 ) },
+    'version|V' => \&version,
+    'output|o=s' => sub {
+        $outputfile = $_[1];
+        $openmode   = '>>';
+    },
+    'Output|O=s' => sub {
+        $outputfile = $_[1];
+        $openmode   = '>';
+    },
+    'root|r=s'   => \$root,
+    'cfg|c=s'    => \@configs,
+    'nocfg|C'    => sub { @configs = () },
+    'verbose|v+' => \$verbose,
+    'delete|d'   => \$delete,
+) or &pod2usage(2);
 
 &pod2usage(2) unless (@ARGV);
 
-# Sanitize parsed variables:
+# -------------------------------
+# Sanitize parsed variables
+# -------------------------------
 
 $root = Cwd::abs_path($root) unless ( $root eq '' );
 $root =~ s{\/$}{};
 
 # Append $root to parsed arguments:
-
 for my $dir (@ARGV) {
-  if ( $dir =~ m{^\/} ) {
-    $dir = $root . $dir unless ( $root eq '' );
-  }
-  $dir = Cwd::abs_path($dir);
-  &fatal("$dir is not a directory") unless ( -d $dir );
+    if ( $dir =~ m{^/} ) {
+        $dir = $root . $dir unless ( $root eq '' );
+    }
+    $dir = Cwd::abs_path($dir);
+    &fatal("$dir is not a directory") unless ( -d $dir );
 }
 
 # Output results of parsing arguments and configs:
-
-&verbose( '',                 1 );
-&verbose( '$root: ' . $root,  1 );
+&verbose('', 1);
+&verbose('$root: ' . $root, 1);
 &verbose( [ 'ARGV', \@ARGV ], 1 );
 
 # The default config must be parsed before the function
 {
-
-  package CFG;
-  our $root = $FindCruft::root;
-  our @cut  = qw(
-      /dev
-      /proc
-      /sys
-      /run
-      /media
-      /mnt
-      /tmp
-  );
-  our @cutre         = ();
-  our @cutexceptions = ();
-  our @follow        = ();
-  our @symlinks      = ();
+    package CFG;
+    our $root = $FindCruft::root;
+    our @cut  = qw(
+        /dev
+        /proc
+        /sys
+        /run
+        /media
+        /mnt
+        /tmp
+    );
+    our @cutre         = ();
+    our @cutexceptions = ();
+    our @follow        = ();
+    our @symlinks      = ();
 }
 
-# Functions used in the configuration file:
+# -------------------------------
+# Functions used in the config
+# -------------------------------
 
 sub remove_root($) {
-  my $string = ( shift() // '' );
-  $string =~ s{^\Q$root\E}{};
-  $string;
+    my $string = ( shift() // '' );
+    $string =~ s{^\Q$root\E}{};
+    return $string;
 }
 
 sub push_without_root(\@@) {
-  my ( $array, @rest ) = @_;
-  for my $i (@rest) {
-    my $j = &remove_root($i);
-    push( @$array, $j ) unless ( $j eq '' );
-  }
+    my ( $array, @rest ) = @_;
+    for my $i (@rest) {
+        my $j = &remove_root($i);
+        push( @$array, $j ) unless ( $j eq '' );
+    }
 }
 
 our @EXPORT = qw(
@@ -423,12 +145,13 @@ our @EXPORT = qw(
     fatal
 );
 
-# Read config files:
+# -------------------------------
+# Read config files
+# -------------------------------
 
 &read_cfg();
 
 # transform configuration data:
-
 my %cut           = ();
 my %follow        = ();
 my @symlinks      = ();
@@ -440,9 +163,8 @@ my @cutexceptions = ();
 &compile_re( \@CFG::cutexceptions, \@cutexceptions );
 &prepare_symlinks( \@CFG::symlinks, \@symlinks );
 
-# Output result of config files
-
-&verbose( '', 2 );
+# Output result of config
+&verbose('', 2);
 &verbose( [ 'follow',        \%follow ],        2 );
 &verbose( [ 'cut',           \%cut ],           2 );
 &verbose( [ 'cutre',         \@cutre ],         2 );
@@ -450,356 +172,396 @@ my @cutexceptions = ();
 &verbose( [ 'symlinks',      \@symlinks ],      2 );
 
 # Files owned by portage are no cruft:
-
 &fill_skip();
 
 # Process filesystem:
-
 if ( $outputfile ne '' ) {
-  open( $fh, $openmode, $outputfile )
+    open( $fh, $openmode, $outputfile )
       or &fatal( "cannot open $openmode$outputfile:", $! );
-  &process_dirs( \@ARGV );
-  close($fh);
+    &process_dirs( \@ARGV );
+    close($fh);
 }
 else {
-  &process_dirs( \@ARGV );
+    &process_dirs( \@ARGV );
 }
 
-#
-# Functions
-#
+# -------------------------------
+# Subroutines
+# -------------------------------
 
 sub version {
-  print( $name, ' ', $VERSION, "\n" );
-  exit(0);
+    print( $name, ' ', $VERSION, "\n" );
+    exit(0);
 }
 
 sub pod2usage {
-  require Pod::Usage;
-  &Pod::Usage::pod2usage;
+    require Pod::Usage;
+    &Pod::Usage::pod2usage;
 }
 
-# Output fatal error and die:
-
+# Output fatal error and die
 sub fatal(@) {
-  print( STDERR "$name: fatal: ", join( "\n" . ( ' ' x ( length($name) + 9 ) ), @_ ), "\n" );
-  exit(1);
+    print( STDERR "$name: fatal: ",
+        join( "\n" . ( ' ' x ( length($name) + 9 ) ), @_ ), "\n" );
+    exit(1);
 }
 
 # Output verbose information:
 # First argument: string or ['name', \@array ] or ['name', \%hash ]
-# Second argument: minimal $verbose level (0 if not specified)
-
+# Second argument: minimal $verbose level
 sub verbose {
-  return if ( ( $verbose == 0 ) || ( ( scalar(@_) >= 2 ) && ( $verbose <= $_[1] ) ) );
-  my $data = @_ ? $_[0] : '';
-  unless ( ref($data) eq 'ARRAY' ) {
-    if ($outputfile) {
-      print( $data, "\n" );
+    return if ( ( $verbose == 0 ) || ( ( scalar(@_) >= 2 ) && ( $verbose < $_[1] ) ) );
+    my $data = @_ ? $_[0] : '';
+    unless ( ref($data) eq 'ARRAY' ) {
+        if ($outputfile) {
+            print( $fh $data, "\n" ) if defined $fh;
+        }
+        else {
+            print STDERR $data, "\n";
+        }
+        return;
     }
-    else {
-      print( STDERR $data, "\n" );
+
+    my ( $title, $ref ) = @$data;
+    if ( ref($ref) eq 'ARRAY' ) {
+        return unless (@$ref);
+        &verbose( '@' . $title . ':' );
+        for my $i (@$ref) {
+            if ( ref($i) ne 'ARRAY' ) {
+                &verbose($i);
+            }
+            else {
+                &verbose( '[' . join( ', ', @$i ) . ']' );
+            }
+        }
+        &verbose();
+        return;
     }
-    return;
-  }
-  my ( $title, $ref ) = @$data;
-  if ( ref($ref) eq 'ARRAY' ) {
-    return unless (@$ref);
-    &verbose( '@' . $title . ':' );
-    for my $i (@$ref) {
-      if ( ref($i) ne 'ARRAY' ) {
-        &verbose($i);
-      }
-      else {
-        &verbose( '[' . join( ', ', @$i ) . ']' );
-      }
+    if ( ref($ref) eq 'HASH' ) {
+        return unless (%$ref);
+        &verbose( '@' . $title . ':' );
+        for my $i ( sort( keys(%$ref) ) ) {
+            &verbose($i);
+        }
+        &verbose();
+        return;
     }
-    &verbose();
-    return;
-  }
-  if ( ref($ref) eq 'HASH' ) {
-    return unless (%$ref);
-    &verbose( '@' . $title . ':' );
-    for my $i ( sort( keys(%$ref) ) ) {
-      &verbose($i);
-    }
-    &verbose();
-    return;
-  }
 }
 
 # return normalized \$filename (but keeping /../ for symlinks)
-
 sub normalized {
-  my $res = File::Spec->canonpath( $_[0] );
-  ( ( $res eq '' ) ? $rootdir : $res );
+    my $res = File::Spec->canonpath( $_[0] );
+    return ( ( $res eq '' ) ? $rootdir : $res );
 }
 
-# Transform \@array into \%hash of undef values; normalized entries:
-
+# Transform \@array into \%hash of undef values; normalized entries
 sub transform {
-  my ( $array, $hash ) = @_;
-  for my $i (@$array) {
-    next unless ( ( $i // '' ) ne '' );
-    $i = &normalized($i);
-    ${$hash}{$i} = undef;
-  }
-  @$array = ();
+    my ( $array, $hash ) = @_;
+    for my $i (@$array) {
+        next unless ( ( $i // '' ) ne '' );
+        $i = &normalized($i);
+        ${$hash}{$i} = undef;
+    }
+    @$array = ();
 }
 
-# Compile all regular expresssions from \@array into \@output if not compiled:
-
+# Compile all regular expressions from \@array into \@output
 sub compile_re {
-  my ( $array, $output ) = @_;
-  for my $i (@$array) {
-    next unless ( defined($i) );
-    if ( ref($i) eq 'Regexp' ) {
-      push( @$output, $i );
+    my ( $array, $output ) = @_;
+    for my $i (@$array) {
+        next unless ( defined($i) );
+        if ( ref($i) eq 'Regexp' ) {
+            push( @$output, $i );
+        }
+        elsif ( $i ne '' ) {
+            push( @$output, qr{$i} );
+        }
     }
-    elsif ( $i ne '' ) {
-      push( @$output, qr{$i} );
-    }
-  }
-  @$array = ();
+    @$array = ();
 }
 
-# Transform \@symlinks into \@output; normalized entries:
-
+# Transform \@symlinks into \@output; normalized entries
 sub prepare_symlinks {
-  my ( $array, $output ) = @_;
-  for my $i (@$array) {
-    next unless ( defined($i) && ( ref($i) eq 'ARRAY' ) );
-    my $r    = [];
-    my $last = scalar(@$i) - 1;
-    for ( my $j = 0; $j < @$i; ++$j ) {
-      my $s = $i->[$j];
-      next unless ( defined($s) && File::Spec->file_name_is_absolute($s) );
-      $s = &normalized($s);
-      if ( $j < $last ) {
-        my $source = $root . $s;
-        if ( ( !( -e $source ) ) || ( Cwd::abs_path($source) ne $source ) ) {
-          push( @$r, $s );
+    my ( $array, $output ) = @_;
+    for my $i (@$array) {
+        next unless ( defined($i) && ( ref($i) eq 'ARRAY' ) );
+        my $r    = [];
+        my $last = scalar(@$i) - 1;
+        for ( my $j = 0 ; $j < @$i ; ++$j ) {
+            my $s = $i->[$j];
+            next unless ( defined($s) && File::Spec->file_name_is_absolute($s) );
+            $s = &normalized($s);
+            if ( $j < $last ) {
+                my $source = $root . $s;
+                if ( ( !( -e $source ) ) || ( Cwd::abs_path($source) ne $source ) ) {
+                    push( @$r, $s );
+                }
+            }
+            elsif (@$r) {
+                my $dest = $root . $s;
+                if ( ( -d $dest ) && ( Cwd::abs_path($dest) eq $dest ) ) {
+                    push( @$r,      $s );
+                    push( @$output, $r );
+                }
+            }
         }
-      }
-      elsif (@$r) {
-        my $dest = $root . $s;
-        if ( ( -d $dest ) && ( Cwd::abs_path($dest) eq $dest ) ) {
-
-          # destination is dir without symlinks
-          push( @$r,      $s );
-          push( @$output, $r );
-        }
-      }
     }
-  }
-  @$array = ();
+    @$array = ();
 }
 
 # The main function to read a configuration file:
-
 sub read_cfg_file {
-  my ($file) = @_;
-  {
-    my $newfile = Cwd::abs_path($file) // '';
-    unless ( -f $newfile ) {
-      $file = '""' if ( $file eq '' );
-      &verbose("skipping config file $file (not a file)");
-      return;
+    my ($file) = @_;
+    {
+        my $newfile = Cwd::abs_path($file) // '';
+        unless ( -f $newfile ) {
+            $file = '""' if ( $file eq '' );
+            &verbose("skipping config file $file (not a file)");
+            return;
+        }
+        $file = $newfile;
     }
-    $file = $newfile
-  }
-  &verbose("reading config file $file");
+    &verbose("reading config file $file");
 
-  package CFG;
-  our $root = $FindCruft::root;
-  our @cut;
-  our @cutre;
-  our @cutexceptions;
-  our @follow;
-  our @symlinks;
-  FindCruft->import();
-  my $ret = do($file);
-  &fatal( "error parsing $file:",  $@ ) if ($@);
-  &fatal( "failed to read $file:", $! ) unless ( defined($ret) );
-  &fatal( "failed to run $file",   'perhaps the last executed command was not a true expression' )
+    package CFG;
+    our $root = $FindCruft::root;
+    our @cut;
+    our @cutre;
+    our @cutexceptions;
+    our @follow;
+    our @symlinks;
+    FindCruft->import();
+    my $ret = do($file);
+    FindCruft::fatal( "error parsing $file:",  $@ ) if ($@);
+    FindCruft::fatal( "failed to read $file:", $! ) unless ( defined($ret) );
+    FindCruft::fatal( "failed to run $file",
+        'perhaps the last executed command was not a true expression' )
       unless ($ret);
 }
 
 # The main function to read the configuration files:
-
 sub read_cfg {
-  my @files = ();
-  for my $paths (@configs) {
-    my %read  = ();
-    my @paths = ( split( /\|/, $paths ) );
-    for my $p (@paths) {
-      next if ( $p eq '' );
-      my $first = substr( $p, 0, 1 );
-      if ( $first eq '$' ) {
-        $p = $root . substr( $p, 1 );
-      }
-      elsif ( $first eq '~' ) {
-        next if ( ( $home //= ( $ENV{'HOME'} // '' ) ) eq '' );
-        $p = $home . substr( $p, 1 );
-      }
-      next unless ( -r $p );
-      unless ( -d $p ) {
-        push( @files, $p ) if ( -f $p );
-        last;
-      }
-      opendir( my $dh, $p ) || next;
-      my @dir = grep { m{^..*\.pl$} && !exists( $read{$_} ) } readdir($dh);
-      closedir($dh);
-      my @unsorted = ();
-      for my $file (@dir) {
-        my $full = File::Spec->catfile( $p, $file );
-        next if ( ( -d $full ) || !( -r $full ) );
-        $read{$file} = 1;
-        push( @unsorted, $full ) if ( -f $full );
-      }
-      push( @files, sort(@unsorted) ) if (@unsorted);
+    my @files;
+    for my $paths (@configs) {
+        my %read;
+        my @paths = ( split( /\|/, $paths ) );
+        for my $p (@paths) {
+            next if ( $p eq '' );
+            my $first = substr( $p, 0, 1 );
+            if ( $first eq '$' ) {
+                $p = $root . substr( $p, 1 );
+            }
+            elsif ( $first eq '~' ) {
+                next if ( ( $home //= ( $ENV{'HOME'} // '' ) ) eq '' );
+                $p = $home . substr( $p, 1 );
+            }
+            next unless ( -r $p );
+            unless ( -d $p ) {
+                push( @files, $p ) if ( -f $p );
+                last;
+            }
+            opendir( my $dh, $p ) || next;
+            my @dir = grep { m{^..*\.pl$} && !exists( $read{$_} ) } readdir($dh);
+            closedir($dh);
+            my @unsorted;
+            for my $file (@dir) {
+                my $full = File::Spec->catfile( $p, $file );
+                next if ( ( -d $full ) || !( -r $full ) );
+                $read{$file} = 1;
+                push( @unsorted, $full ) if ( -f $full );
+            }
+            push( @files, sort(@unsorted) ) if (@unsorted);
+        }
     }
-  }
-  for my $file (@files) {
-    &read_cfg_file($file);
-  }
+    for my $file (@files) {
+        &read_cfg_file($file);
+    }
 }
 
 # The main function to process the database tree:
-
 sub wanted_skip {
-  return unless ( m{\/CONTENTS$} && open( my $content, '<', $_ ) );
-  while (<$content>) {
-    chomp();
-    next if ( length($_) < 4 );
-    my $type = substr( $_, 0, 3 );
-    my $path = substr( $_, 4 );
-    if ( $type eq 'obj' ) {
-      $path =~ s{\s+\S+\s+\S+$}{};
+    return unless ( m{\/CONTENTS$} && open( my $content, '<', $_ ) );
+    while (<$content>) {
+        chomp();
+        next if ( length($_) < 4 );
+        my $type = substr( $_, 0, 3 );
+        my $path = substr( $_, 4 );
+        if ( $type eq 'obj' ) {
+            $path =~ s{\s+\S+\s+\S+$}{};
+        }
+        elsif ( $type eq 'sym' ) {
+            $path =~ s{\s+\-\>\s+.*$}{};
+        }
+        elsif ( $type ne 'dir' ) {
+            next;
+        }
+        $path = &normalized($path);
+        my $pathlen = length($path);
+        $skip{$path} = undef;
+        for my $i (@symlinks) {
+            my $length = 0;
+            my $last   = scalar(@$i) - 1;
+            my $s;
+            for ( my $j = 0 ; $j < @$i ; ++$j ) {
+                $s = $i->[$j];
+                last if ( $j >= $last );
+                my $l = length($s);
+                next if ( $l > $pathlen );
+                $length = $l
+                  if (
+                    ( $length <= $l )
+                    && (
+                           ( ( $l == $pathlen ) && ( $s eq $path ) )
+                        || ( ( ( $s . '/' ) eq substr( $path, 0, $l + 1 ) ) )
+                      )
+                  );
+            }
+            next if ( $length == 0 );
+            my $rest = substr( $path, $length );
+            if ( ( substr( $rest, 0, 1 ) eq '/' ) || ( $rest eq '' ) ) {
+                $skip{ $s . $rest } = undef;
+            }
+        }
     }
-    elsif ( $type eq 'sym' ) {
-      $path =~ s{\s+\-\>\s+.*$}{};
-    }
-    elsif ( $type ne 'dir' ) {
-      next;
-    }
-    $path = &normalized($path);
-    my $pathlen = length($path);
-    $skip{$path} = undef;
-    for my $i (@symlinks) {
-      my $length = 0;
-      my $last   = scalar(@$i) - 1;
-      my $s;
-      for ( my $j = 0; $j < @$i; ++$j ) {
-        $s = $i->[$j];
-        last if ( $j >= $last );
-        my $l = length($s);
-        next if ( $l > $pathlen );
-        $length = $l if (
-          ( $length <= $l )
-          && ( ( ( $l == $pathlen ) && ( $s eq $path ) )
-            || ( ( ( $s . '/' ) eq substr( $path, 0, $l + 1 ) ) ) )
-        );
-      }
-      next if ( $length == 0 );
-      my $rest = substr( $path, $length );
-      if ( ( substr( $rest, 0, 1 ) eq '/' ) || ( $rest eq '' ) ) {
-        $skip{ $s . $rest } = undef;
-      }
-    }
-  }
-  close($content);
+    close($content);
 }
 
 # Recursively process the database tree
-
 sub fill_skip {
-  &verbose('Determining files owned by portage');
-  File::Find::find(
-    { no_chdir => 1,
-      wanted   => \&wanted_skip
-    },
-    ( $root . '/var/db/pkg' )
-  );
+    &verbose('Determining files owned by portage');
+    File::Find::find(
+        {
+            no_chdir => 1,
+            wanted   => \&wanted_skip
+        },
+        ( $root . '/var/db/pkg' )
+    );
 }
 
-# Args: \$string, \@array_of_regexp
-# Returns whether $string matches a regexp
-
+# Returns whether $string matches any regexp in \@array
 sub match_array {
-  my ( $string, $array ) = @_;
-  for my $i (@$array) {
-    return 1 if ( $$string =~ $i );
-  }
-  return '';
+    my ( $string, $array ) = @_;
+    for my $i (@$array) {
+        return 1 if ( $$string =~ $i );
+    }
+    return '';
 }
 
 # The main function to process the file tree:
-
 sub wanted_files {
-  my $path = &remove_root($_);
-  return if ( ( $path eq '' ) or ( $path eq $rootdir ) );
-  return if &is_ignored($path);
-  if ( exists( $cut{$path} ) || &match_array( \$path, \@cutre ) ) {
-    unless ( &match_array( \$path, \@cutexceptions ) ) {
-      $File::Find::prune = 1;
-      return;
-    }
-  }
-  if ( -l $_ ) {
-    $File::Find::prune = 1 unless ( exists( $follow{$path} ) );
-  }
-  return if ( exists( $skip{$path} ) );
-  $skip{$path} = undef;
+    my $path = &remove_root($_);
+    return if ( ( $path eq '' ) or ( $path eq $rootdir ) );
+    return if &is_ignored($path);
 
-  if ($delete) {
-    if ( -f $_ || -l $_ ) {
-      unlink($_) or warn "Failed to delete file: $path\n";
+    # Prune if explicit or matched by a cut pattern (and not in exceptions).
+    if ( exists( $cut{$path} ) || &match_array( \$path, \@cutre ) ) {
+        unless ( &match_array( \$path, \@cutexceptions ) ) {
+            $File::Find::prune = 1;
+            return;
+        }
     }
-    elsif ( -d $_ ) {
-      rmdir($_) or warn "Failed to delete directory (not empty?): $path\n";
+
+    # Prune if it's a symlink and not in the "follow" list
+    if ( -l $_ ) {
+        $File::Find::prune = 1 unless ( exists( $follow{$path} ) );
+    }
+
+    # Already known to be owned by portage or processed
+    return if ( exists( $skip{$path} ) );
+    $skip{$path} = undef;
+
+    # -----------------------------
+    # Actual "delete or list" logic
+    # -----------------------------
+    if ($delete) {
+        # Remove discovered cruft
+        if ( -f $_ || -l $_ ) {
+            unlink($_)
+              or warn "Failed to delete file/link: $path\n";
+        }
+        elsif ( -d $_ ) {
+            # Recursively remove directories
+            my $count = remove_tree($_, { safe => 0 });
+            if ( $count == 0 ) {
+                warn "Failed to delete directory (maybe not empty or no perms?): $path\n";
+            }
+            # Since we've removed it, prune so File::Find doesn't recurse further
+            $File::Find::prune = 1;
+        }
+        else {
+            warn "Unsupported file type: $path\n";
+        }
     }
     else {
-      warn "Unsupported file type: $path\n";
+        # Just list the path
+        if ( defined($fh) ) {
+            print( $fh $path, "\n" );
+        }
+        else {
+            print( $path, "\n" );
+        }
     }
-  }
-  else {
-    if ( defined($fh) ) {
-      print( $fh $path, "\n" );
-    }
-    else {
-      print( $path, "\n" );
-    }
-  }
 }
 
 # Recursively process the file tree for all entries in passed array reference
-
 sub process_dirs {
-  my ($dirs) = @_;
-  &verbose('Processing file tree');
-  &verbose('');
-  no warnings 'File::Find';
-  File::Find::find(
-    { no_chdir          => 1,
-      follow_fast       => 1,
-      follow_skip       => 2,
-      dangling_symlinks => '',
-      wanted            => \&wanted_files
-    },
-    @$dirs
-  );
+    my ($dirs) = @_;
+    &verbose('Processing file tree');
+    &verbose('');
+    no warnings 'File::Find';
+    File::Find::find(
+        {
+            no_chdir          => 1,
+            follow_fast       => 1,
+            follow_skip       => 2,
+            dangling_symlinks => '',
+            wanted            => \&wanted_files
+        },
+        @$dirs
+    );
 }
 
+# Return true if path should be explicitly ignored
 sub is_ignored {
-  my $path = shift;
-  foreach my $ignore (@ignore_list) {
-    if ( $ignore =~ /\/$/ ) {
-      return 1 if $path =~ /^\Q$ignore\E/;
+    my $path = shift;
+    foreach my $ignore (@ignore_list) {
+        # If ignore entry ends with "/", treat as "prefix" ignore
+        if ( $ignore =~ /\/$/ ) {
+            return 1 if $path =~ /^\Q$ignore\E/;
+        }
+        else {
+            return 1 if $path eq $ignore;
+        }
     }
-    else {
-      return 1 if $path eq $ignore;
-    }
-  }
-  return 0;
+    return 0;
 }
+
+__END__
+
+=head1 NAME
+
+find_cruft - Find (and optionally delete) unowned files on a Gentoo system
+
+=head1 SYNOPSIS
+
+  find_cruft [options] [paths]
+
+  Options:
+    -h, --help        display brief help
+    -?, --man         display full manual
+    -V, --version     display version
+    -o, --output      append output to file
+    -O, --Output      overwrite output file
+    -r, --root        set custom root
+    -c, --cfg         load additional config
+    -C, --nocfg       do not load any config
+    -v, --verbose     increase verbosity
+    -d, --delete      delete any discovered 'cruft'
+
+=head1 DESCRIPTION
+
+By default, this script lists files that are believed to be unowned by
+the system package manager (Portage). Passing C<--delete> will remove them
+(recursively in the case of directories). Use with caution.
+
+=cut
