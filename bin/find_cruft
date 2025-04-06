@@ -1,60 +1,66 @@
 #!/usr/bin/env perl
+# SPDX-License-Identifier: BSD-3-Clause
+BEGIN { require 5.008 }
 
 use strict;
 use warnings;
+use integer;
+
+use Cwd        ();
+use File::Spec ();
 use File::Find ();
-use Getopt::Long ();
-use Pod::Usage   ();
-use File::Spec   ();
-use Cwd          ();
-use File::Path   qw(remove_tree);
+use Getopt::Long qw(:config gnu_getopt no_ignore_case);
+use File::Path qw(remove_tree);
 
-# -------------------------------
-# Static variables
-# -------------------------------
-
+# ---------------------------------------------------------------------------
+# Script metadata
+# ---------------------------------------------------------------------------
 my $name    = 'find_cruft';
-my $VERSION = '1.0';
-my $rootdir = File::Spec->rootdir();
+my $VERSION = 'v5.2.0';
 
-# -------------------------------
+=head1 NAME
+
+find_cruft - find (and optionally delete) cruft files on Gentoo
+
+=head1 SYNOPSIS
+
+  find_cruft [options] [directories...]
+
+Options:
+  -h, --help       Show brief help
+  -?, --man        Show extended manpage
+  -V, --version    Print version and exit
+  -v, --verbose    Increase verbosity (can repeat)
+  -r, --root       Use this directory as root
+  -o, --output     Append output to file
+  -O, --Output     Overwrite output file
+  -d, --delete     Delete discovered cruft instead of listing
+
+Examples:
+  find_cruft /       # Lists all unowned files system-wide
+  find_cruft --delete /usr/lib/python3.11
+
+=cut
+
+# ---------------------------------------------------------------------------
 # Global variables
-# -------------------------------
+# ---------------------------------------------------------------------------
 
-my $fh       = undef;
-my $delete   = 0;
-my $verbose  = 0;
+my $fh;
 my $outputfile = '';
 my $openmode   = '>>';
+my $verbose    = 0;
 my $root       = '';
-my %skip       = ();
+my $delete     = 0;   # Whether to remove discovered files
+my %skip       = ();  # portage-owned files
+my $rootdir    = File::Spec->rootdir();
 
-# Files or directories we always ignore:
-my @ignore_list = (
-    "/etc/group",
-    "/etc/group-",
-    "/etc/gshadow",
-    "/etc/gshadow-",
-    "/etc/ld.so.cache",
-    "/etc/passwd",
-    "/etc/passwd-",
-    "/etc/portage/make.conf",
-    "/etc/shadow",
-    "/etc/shadow-",
-    "/usr/lib/modules/",
-    "/var/cache/binpkgs/",
-    "/var/cache/distfiles/",
-    "/etc/config-archive/"
-);
-
-# -------------------------------
-# Parse Options
-# -------------------------------
-
-Getopt::Long::Configure(qw(gnu_getopt no_ignore_case));
-Getopt::Long::GetOptions(
+# ---------------------------------------------------------------------------
+# Option parsing
+# ---------------------------------------------------------------------------
+GetOptions(
     'help|h'       => sub { pod2usage(0) },
-    'man|?'        => sub { pod2usage( -verbose => 2, -exit => 0 ) },
+    'man|?'        => sub { pod2usage(-verbose => 2, -exit => 0) },
     'version|V'    => \&version,
     'verbose|v+'   => \$verbose,
     'delete|d'     => \$delete,
@@ -63,57 +69,180 @@ Getopt::Long::GetOptions(
     'root|r=s'     => \$root,
 ) or pod2usage(2);
 
-# We need at least one path argument:
-pod2usage(2) unless @ARGV;
+(@ARGV) or pod2usage(2);
 
-# -------------------------------
-# Handle user-specified root
-# -------------------------------
-if ( $root ne '' ) {
-    $root = Cwd::abs_path($root);
-    $root =~ s{/$}{};
-}
+# ---------------------------------------------------------------------------
+# Resolve --root and arguments
+# ---------------------------------------------------------------------------
+$root = Cwd::abs_path($root) if ($root ne '');
+$root =~ s{/$}{} if defined $root;
 
-# Convert each path argument to absolute form under $root (if set)
 foreach my $dir (@ARGV) {
-    if ( $dir =~ m{^/} ) {
-        $dir = $root . $dir unless $root eq '';
+    if ($dir =~ m{^/}) {
+        $dir = $root . $dir unless ($root eq '');
     }
     $dir = Cwd::abs_path($dir);
     fatal("$dir is not a directory") unless -d $dir;
 }
 
-# -------------------------------
-# Possibly open an output file
-# -------------------------------
-if ($outputfile) {
-    open( $fh, $openmode, $outputfile )
-      or fatal( "Cannot open $openmode$outputfile:", $! );
+verbose('', 1);
+verbose("\$root: $root", 1);
+verbose([ 'ARGV', \@ARGV ], 1);
+
+# ---------------------------------------------------------------------------
+# Build ignore sets (the snippet logic) - all in one place
+# ---------------------------------------------------------------------------
+
+# Hard-coded directories to skip scanning:
+my @cut = (
+    '/dev', '/proc', '/sys', '/run', '/media', '/mnt', '/tmp',
+
+    # Snippet extras:
+    '/home', '/root', '/srv', '/boot', '/var/tmp', '/var/db', '/var/cache/edb',
+);
+
+# Regex-based skipping:
+my @cutre         = ();
+my @cutexceptions = ();
+
+# Symlinks that we unify:
+my @symlinks = (
+    [qw(/usr/doc /usr/share/doc)],
+    [qw(/usr/man /usr/share/man)],
+    [qw(/usr/info /usr/share/info)],
+    [qw(/usr/tmp /usr/var/tmp)],
+    [qw(/var/mail /var/spool/mail)],
+    [qw(/lib /lib64)],
+    [qw(/lib64 /lib)],
+);
+
+# Symlink following (i.e. if it’s a symlink, do we descend?)
+my @follow = ();
+
+# 1) Possibly detect $portdir
+$ENV{'EIX_PREFIX'}   = $root;
+$ENV{'PRINT_APPEND'} = '';
+my $portdir = remove_root(`eix --print PORTDIR 2>/dev/null`);
+if ($portdir eq '') {
+    $portdir = `portageq get_repo_path '$root/' gentoo 2>/dev/null || portageq portdir 2>/dev/null`;
+    chomp($portdir);
+    $portdir = $root . '/usr/portage' if ($portdir eq '');
+}
+push @cut, remove_root($portdir);
+
+# 2) Skip kernel dirs
+my $kernel_dir = remove_root($ENV{'KERNEL_DIR'});
+$kernel_dir = '/usr/src/linux' if ($kernel_dir eq '');
+push @cut, $kernel_dir;
+if (my $kd_abs = Cwd::abs_path($root . $kernel_dir)) {
+    push @cut, remove_root($kd_abs);
 }
 
-verbose("Root: $root", 1);
-verbose( [ 'ARGV', \@ARGV ], 1 );
+my $kbuild_output = remove_root($ENV{'KBUILD_OUTPUT'});
+if ($kbuild_output ne '') {
+    push @cut, $kbuild_output;
+    if (my $kb_abs = Cwd::abs_path($root . $kbuild_output)) {
+        push @cut, remove_root($kb_abs);
+    }
+}
 
-# -------------------------------
-# Mark Portage-owned files to skip
-# -------------------------------
-fill_skip();
+# Now build internal data structures:
+my (%cut, %follow);
+my (@cutre_compiled, @cutexc_compiled, @symlinks_prepared);
 
-# -------------------------------
-# Process filesystem
-# -------------------------------
+# Convert @cut => %cut
+foreach (@cut) {
+    next unless defined $_ and $_ ne '';
+    $cut{ normalized($_) } = undef;
+}
+
+# Convert @follow => %follow
+foreach (@follow) {
+    next unless defined $_ and $_ ne '';
+    $follow{ normalized($_) } = undef;
+}
+
+# Convert @cutre => compiled
+foreach (@cutre) {
+    next unless defined $_;
+    if (ref($_) eq 'Regexp') {
+        push @cutre_compiled, $_;
+    } else {
+        push @cutre_compiled, qr($_);
+    }
+}
+
+# Convert @cutexceptions => compiled
+foreach (@cutexceptions) {
+    next unless defined $_;
+    if (ref($_) eq 'Regexp') {
+        push @cutexc_compiled, $_;
+    } else {
+        push @cutexc_compiled, qr($_);
+    }
+}
+
+# Prepare symlinks
+foreach my $arr (@symlinks) {
+    next unless ref($arr) eq 'ARRAY';
+    my @temp;
+    my $last = $#$arr;
+    for (my $i = 0; $i < @$arr; ++$i) {
+        my $s = $arr->[$i];
+        next unless $s && File::Spec->file_name_is_absolute($s);
+        $s = normalized($s);
+        if ($i < $last) {
+            # partial (link part)
+            my $source = $root . $s;
+            if (! -e $source or (Cwd::abs_path($source) ne $source)) {
+                push @temp, $s;
+            }
+        } else {
+            # last is the real dir
+            if (@temp) {
+                my $dest = $root . $s;
+                if (-d $dest and Cwd::abs_path($dest) eq $dest) {
+                    push @temp, $s;
+                    push @symlinks_prepared, [ @temp ];
+                }
+            }
+        }
+    }
+}
+
+# Debug
+verbose('', 2);
+verbose(['cut',         [ keys %cut ]], 2);
+verbose(['cutre',       \@cutre_compiled ], 2);
+verbose(['cutexceptions', \@cutexc_compiled ], 2);
+verbose(['follow',      [ keys %follow ]], 2);
+verbose(['symlinks',    \@symlinks_prepared ], 2);
+
+# ----------------------------------------------------------------------------
+# Mark portage-owned files
+# ----------------------------------------------------------------------------
+
+fill_skip();  # populates %skip
+
+# ----------------------------------------------------------------------------
+# Possibly open output file
+# ----------------------------------------------------------------------------
+if ($outputfile ne '') {
+    open($fh, $openmode, $outputfile)
+        or fatal("Cannot open $openmode$outputfile: $!");
+}
+
 process_dirs(\@ARGV);
 
-# Close output file if opened
-close $fh if $fh;
+close($fh) if $fh;
 
-# -------------------------------
-# Subroutines
-# -------------------------------
+# =============================
+# SUBROUTINES
+# =============================
 
 sub version {
     print("$name $VERSION\n");
-    exit 0;
+    exit(0);
 }
 
 sub pod2usage {
@@ -124,199 +253,233 @@ sub pod2usage {
 sub fatal {
     my @msgs = @_;
     warn("$name: fatal: @msgs\n");
-    exit 1;
+    exit(1);
 }
 
-# Print verbose messages to stderr (or filehandle if --output)
 sub verbose {
-    # Only print if $verbose is high enough
-    my ($msg, $level) = ( $_[0], $_[1] // 0 );
+    # arg1: message or [ label, ref ]
+    # arg2: minimal verbosity
+    my $msg   = @_ ? $_[0] : '';
+    my $level = @_ > 1 ? $_[1] : 0;
     return if $verbose < $level;
 
-    if (ref $msg eq 'ARRAY') {
-        # e.g. [ "Title", \@stuff ]
+    if (ref($msg) eq 'ARRAY') {
         my ($title, $ref) = @$msg;
-        return unless @$ref;
-        verbose("@$title:", $level);
-        foreach my $val (@$ref) {
-            if (ref($val) eq 'ARRAY') {
-                verbose("[" . join(", ", @$val) . "]", $level);
-            } else {
-                verbose($val, $level);
+        if (ref($ref) eq 'ARRAY') {
+            return unless @$ref;
+            my $handle = $fh ? $fh : \*STDERR;
+            print $handle "@$title:\n";
+            for my $x (@$ref) {
+                print $handle "$x\n";
             }
+            print $handle "\n";
         }
-        verbose("", $level);
-    }
-    else {
-        # Just a string
-        if ($fh) {
-            print $fh "$msg\n";
+        elsif (ref($ref) eq 'HASH') {
+            return unless %$ref;
+            my $handle = $fh ? $fh : \*STDERR;
+            print $handle "@$title:\n";
+            for my $k (sort keys %$ref) {
+                print $handle "$k\n";
+            }
+            print $handle "\n";
         }
         else {
-            warn "$msg\n";
+            # fallback
+            my $handle = $fh ? $fh : \*STDERR;
+            print $handle "$title\n";
         }
+    }
+    else {
+        my $handle = $fh ? $fh : \*STDERR;
+        print $handle "$msg\n";
     }
 }
 
-# Return path with $root stripped off front
-sub remove_root {
-    my ($abs_path) = @_;
-    return '' unless defined $abs_path;
-    $abs_path =~ s{^\Q$root\E}{''} if $root ne '';
-    return $abs_path;
+sub normalized {
+    my $res = File::Spec->canonpath(shift);
+    $res eq '' ? $rootdir : $res;
 }
 
-# Mark portage-owned files so we skip them
+sub remove_root {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s{^\Q$root\E}{''} if $root ne '';
+    chomp($s);
+    return $s;
+}
+
+# ----------------------------------------------------------------------------
+# fill_skip - read /var/db/pkg to see all portage-owned files
+# ----------------------------------------------------------------------------
 sub fill_skip {
-    # /var/db/pkg typically contains entries for installed packages
-    # Each package has a CONTENTS file listing installed files
     verbose("Determining files owned by portage", 1);
+    my $db_path = $root . '/var/db/pkg';
+    return unless -d $db_path;
 
-    my $dbpkg = ($root eq '') ? '/var/db/pkg' : "$root/var/db/pkg";
-    return unless -d $dbpkg;
-
-    File::Find::find(
-        {
-            no_chdir => 1,
-            wanted   => \&wanted_skip
-        },
-        $dbpkg
-    );
+    File::Find::find({
+        no_chdir => 1,
+        wanted   => \&wanted_skip
+    }, $db_path);
 }
 
 sub wanted_skip {
-    return unless (m{/CONTENTS$} && open(my $content, '<', $_));
-    while (<$content>) {
+    # only read .../CONTENTS
+    return unless m{/CONTENTS$} && open(my $fh, '<', $_);
+
+    while (<$fh>) {
         chomp;
         next if length($_) < 4;
         my $type = substr($_, 0, 3);
         my $path = substr($_, 4);
 
-        # For 'obj' lines, remove checksums if present
-        if ($type eq 'obj') {
-            $path =~ s{\s+\S+\s+\S+$}{};
-        }
-        elsif ($type eq 'sym') {
-            # Remove the " -> actual_target" part
-            $path =~ s{\s+\-\>.*$}{};
-        }
-        elsif ($type ne 'dir') {
-            next;
-        }
+        if    ($type eq 'obj') { $path =~ s{\s+\S+\s+\S+$}{}; }
+        elsif ($type eq 'sym') { $path =~ s{\s+\->\s+.*$}{}; }
+        elsif ($type ne 'dir') { next; }
 
-        my $norm = normalized($path);
-        $skip{$norm} = 1;
-    }
-    close $content;
-}
+        my $normp = normalized($path);
+        $skip{$normp} = undef;
 
-# Convert path to canonical form, but keep rootdir for empty
-sub normalized {
-    my ($p) = @_;
-    my $res = File::Spec->canonpath($p);
-    return $res eq '' ? $rootdir : $res;
-}
-
-# Return true if path is in @ignore_list
-sub is_ignored {
-    my ($path) = @_;
-    foreach my $ignore (@ignore_list) {
-        # If ignore entry ends with "/", treat it as a prefix
-        if ($ignore =~ m{/$}) {
-            return 1 if $path =~ m{^\Q$ignore\E};
-        }
-        else {
-            return 1 if $path eq $ignore;
+        # also handle symlink expansions
+        for my $symlink_arr (@symlinks_prepared) {
+            my $length  = 0;
+            my $last    = $#$symlink_arr;
+            my $pathlen = length($normp);
+            for (my $j = 0; $j < $last; ++$j) {
+                my $s = $symlink_arr->[$j];
+                my $l = length($s);
+                next if $l > $pathlen;
+                if (($l == $pathlen && $s eq $normp)
+                    || (($s.'/') eq substr($normp, 0, $l+1))) {
+                    $length = $l if $length <= $l;
+                }
+            }
+            next if $length == 0;
+            my $rest = substr($normp, $length);
+            if ((substr($rest, 0, 1) eq '/') || ($rest eq '')) {
+                my $linkbase = $symlink_arr->[0];
+                $skip{$linkbase . $rest} = undef;
+            }
         }
     }
-    return 0;
+    close $fh;
 }
 
-# Recursively walk directories and act on files
-sub process_dirs {
-    my ($dirs) = @_;
-    verbose("", 1);
-    verbose("Processing file tree", 1);
-
-    no warnings 'File::Find';
-    File::Find::find(
-        {
-            no_chdir          => 1,
-            follow_fast       => 1,
-            follow_skip       => 2,
-            dangling_symlinks => '',
-            wanted            => \&wanted_files
-        },
-        @$dirs
-    );
-}
-
-# Called by File::Find for each item
+# ----------------------------------------------------------------------------
+# The main File::Find callback
+# ----------------------------------------------------------------------------
 sub wanted_files {
-    # Remove leading $root from absolute path
-    my $path = remove_root($File::Find::name);
+    my $absolute = $File::Find::name; # absolute path
+    my $path     = remove_root($absolute);
 
-    # Skip root or empty path
-    return if !$path || $path eq '/' || $path eq $rootdir;
+    # skip root or empty
+    return if !$path || $path eq $rootdir;
 
-    # Possibly ignore certain system files
-    return if is_ignored($path);
+    # skip if in @cut or @cutre
+    if (exists $cut{$path} || match_array(\$path, \@cutre_compiled)) {
+        unless (match_array(\$path, \@cutexc_compiled)) {
+            $File::Find::prune = 1;
+            return;
+        }
+    }
 
-    # Skip items Portage says it owns
-    return if $skip{ normalized($File::Find::name) };
+    # skip symlinks not in @follow
+    if (-l $_) {
+        my $normp = normalized($path);
+        unless (exists $follow{$normp}) {
+            $File::Find::prune = 1;
+            return;
+        }
+    }
 
-    # If --delete, remove them
+    # skip if portage owns it
+    return if exists $skip{$path};
+
+    # Mark so we don't process it multiple times
+    $skip{$path} = undef;
+
+    # With --delete
     if ($delete) {
         if (-f $_ || -l $_) {
-            unlink($_) or warn "Failed to delete $path: $!\n";
+            unlink($_) or warn("Failed to delete $path: $!\n");
         }
         elsif (-d $_) {
-            my $count = remove_tree($_, { safe => 0 });
-            if ($count == 0) {
+            my $removed = remove_tree($_, { safe => 0 });
+            if ($removed == 0) {
                 warn "Failed to delete directory $path (permissions or not empty?)\n";
             }
-            $File::Find::prune = 1;  # Don't recurse into a removed directory
+            $File::Find::prune = 1;
         }
         else {
             warn "Unsupported file type: $path\n";
         }
     }
     else {
-        # Otherwise just list them
+        # just list
         if ($fh) {
             print $fh "$path\n";
-        }
-        else {
+        } else {
             print "$path\n";
         }
     }
 }
 
+sub match_array {
+    my ($stringref, $arrayref) = @_;
+    for my $re (@$arrayref) {
+        return 1 if $$stringref =~ $re;
+    }
+    return 0;
+}
+
+sub process_dirs {
+    my ($dirs) = @_;
+    verbose("Processing file tree\n", 1);
+    no warnings 'File::Find';
+    File::Find::find({
+        no_chdir          => 1,
+        follow_fast       => 1,
+        follow_skip       => 2,
+        dangling_symlinks => '',
+        wanted            => \&wanted_files
+    }, @$dirs);
+}
+
 __END__
-
-=head1 NAME
-
-find_cruft - Find (and optionally delete) unowned files on a Gentoo system
-
-=head1 SYNOPSIS
-
-  find_cruft [options] [paths]
-
-Options:
-
-  -h, --help           display brief help
-  -?, --man            display full manual
-  -V, --version        display version
-  -v, --verbose        increase verbosity
-  -d, --delete         delete any discovered 'cruft'
-  -o, --output FILE    append output to FILE
-  -O, --Output FILE    overwrite FILE
-  -r, --root DIR       set custom root (prefix)
 
 =head1 DESCRIPTION
 
-By default, this script lists files that are believed to be unowned by
-the system package manager (Portage). Passing C<--delete> will remove them
-(recursively, in the case of directories). Use with caution.
+This is a **self-contained** script to list or delete unowned files
+(“cruft”) on a Gentoo system. It does not load any external config
+files. The script:
+
+=over 2
+
+=item *
+
+Skips well-known directories (C</home>, C</boot>, etc.) and auto-detects the Portage tree.
+
+=item *
+
+Skips kernel build directories (C<$KERNEL_DIR>, C<$KBUILD_OUTPUT>).
+
+=item *
+
+Respects standard Gentoo symlinks like C</lib -> /lib64>, so they do not cause false positives.
+
+=item *
+
+Can optionally delete the discovered files (C<--delete>).
+
+=back
+
+Usage is straightforward:
+
+  find_cruft /           # list cruft under /
+  find_cruft -d /usr     # delete cruft under /usr
+  find_cruft -v /        # show more debugging output
+
+=head1 AUTHOR
+
+Adapted from Martin Veth's C<find_cruft> with snippet merges. BSD License.
 
 =cut
